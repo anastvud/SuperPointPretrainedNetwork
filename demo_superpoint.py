@@ -303,55 +303,57 @@ class SuperPointFrontend(object):
         import numpy as np 
         import cv2
 
-        # 1. IMAGE PRE-PROCESSING (Force BGR -> Gray)
+        # 1. IMAGE PREPARATION (Gray + CLAHE)
         if img.ndim == 3:
-            # If shape is (3, H, W), convert to (H, W, 3)
             if img.shape[0] == 3: 
                 img = np.transpose(img, (1, 2, 0))
-
-            # PySLAM usually sends BGR images. 
-            # We MUST use BGR2GRAY to match OpenCV training pipelines.
             try:
                 img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             except:
                 img_gray = np.mean(img, axis=2).astype(np.float32)
-                
-            img = img_gray[np.newaxis, :, :] 
         elif img.ndim == 2:
-            img = img[np.newaxis, :, :] 
+            img_gray = img
             
-        H_original, W_original = img.shape[1], img.shape[2]
+        # --- ENHANCEMENT: CLAHE ---
+        # Water/Shore scenes are low contrast. This boosts edge visibility.
+        if img_gray.dtype != np.uint8:
+            # Convert to uint8 for CLAHE if needed
+            img_uint8 = (img_gray * 255).astype(np.uint8) if img_gray.max() <= 1.0 else img_gray.astype(np.uint8)
+        else:
+            img_uint8 = img_gray
+
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        img_gray = clahe.apply(img_uint8)
+        
+        # Convert back to float [0,1] for Network
+        img_norm = img_gray.astype(np.float32) / 255.0
+        img_tensor = img_norm[np.newaxis, :, :] # (1, H, W)
+            
+        H_original, W_original = img_gray.shape[0], img_gray.shape[1]
 
         # 2. RESIZE TO TRAINING RESOLUTION (360x640)
-        inp = torch.from_numpy(img)
+        inp = torch.from_numpy(img_tensor)
         if inp.dim() == 3:
-            inp = inp.unsqueeze(0) # (1, 1, H, W)
+            inp = inp.unsqueeze(0) 
 
         train_h, train_w = 360, 640
         inp = torch.nn.functional.interpolate(inp, size=(train_h, train_w), mode='bilinear', align_corners=False)
 
-        # 3. NORMALIZE (0 to 1)
-        # Your training config is basic, so we stick to [0,1].
-        # If this fails, uncomment the line below to try [-1, 1]:
-        # inp = (inp - 0.5) * 2.0 
-
         if self.cuda:
             inp = inp.cuda()
 
-        # 4. FORWARD PASS
+        # 3. FORWARD PASS
         with torch.no_grad():
             semi, desc = self.net(inp)
 
-        # 5. POST-PROCESSING
+        # 4. POST-PROCESSING
         semi = semi.data.cpu().numpy().squeeze() 
         desc = desc.data.cpu().numpy().squeeze()
         
-        # Softmax & Remove Dustbin
         dense = np.exp(semi) 
         dense = dense / (np.sum(dense, axis=0) + .00001) 
         nodust = dense[:-1, :, :] 
         
-        # Reshape to Heatmap
         Hc = int(nodust.shape[1])
         Wc = int(nodust.shape[2])
         nodust = nodust.transpose(1, 2, 0)
@@ -359,7 +361,7 @@ class SuperPointFrontend(object):
         heatmap = np.transpose(heatmap, [0, 2, 1, 3])
         heatmap = np.reshape(heatmap, [Hc*self.cell, Wc*self.cell])
 
-        # NMS
+        # 5. DETECT POINTS
         Xs, Ys = np.where(heatmap >= self.conf_thresh)
         if len(Xs) == 0:
             return np.zeros((3, 0)), np.zeros((256, 0)), heatmap
@@ -369,44 +371,48 @@ class SuperPointFrontend(object):
         pts[1, :] = Xs # y
         pts[2, :] = heatmap[Xs, Ys]
         
+        # NMS (Keep it strictly applied to avoid clustering on strong edges)
         pts, _ = self.nms_fast(pts, heatmap.shape[0], heatmap.shape[1], dist_thresh=self.nms_dist)
 
+        # --- 6. STRIP MASKING (THE FIX) ---
+        # We are working in 360x640 resolution.
+        
+        # BOTTOM MASK (Water): Remove bottom 40% (y > 216)
+        water_line = train_h * 0.60 
+        
+        # TOP MASK (Sky): Remove top 20% (y < 72)
+        # Clouds move and confuse the odometry.
+        sky_line = train_h * 0.20
+        
+        # Keep points strictly in the "middle strip"
+        valid_mask = (pts[1, :] < water_line) & (pts[1, :] > sky_line)
+        
+        pts = pts[:, valid_mask]
+        
         if pts.shape[1] == 0:
-            return np.zeros((3, 0)), np.zeros((256, 0)), heatmap
+             return np.zeros((3, 0)), np.zeros((256, 0)), heatmap
+        # ----------------------------------
 
-        # 6. SIMPLIFIED DESCRIPTOR SAMPLING
-        # We sample descriptors using the resized coordinates (0..640)
+        # 7. DESCRIPTOR SAMPLING
         def sample_desc(dmap, pts):
-            D, H, W = dmap.shape # 256, 45, 80 (Feature Map Size)
-            
-            # Map points to [-1, 1] range
-            # Note: We use train_w (640) and train_h (360) for normalization
-            # because 'pts' are currently in that coordinate system.
-            
+            D, H, W = dmap.shape 
             x_norm = 2.0 * (pts[0, :] / (train_w - 1)) - 1.0
             y_norm = 2.0 * (pts[1, :] / (train_h - 1)) - 1.0
-            
-            # Stack into (1, 1, N, 2)
             grid = torch.zeros((1, 1, pts.shape[1], 2))
             grid[0, 0, :, 0] = torch.from_numpy(x_norm)
             grid[0, 0, :, 1] = torch.from_numpy(y_norm)
-            
             if self.cuda: grid = grid.cuda()
-            
             dmap_t = torch.from_numpy(dmap).float().view(1, D, H, W)
             if self.cuda: dmap_t = dmap_t.cuda()
-            
-            # Use align_corners=True (Standard for most SuperPoint trainings)
             desc = torch.nn.functional.grid_sample(dmap_t, grid, align_corners=True)
             desc = torch.nn.functional.normalize(desc, p=2, dim=1)
             return desc.data.cpu().numpy().squeeze()
 
         desc = sample_desc(desc, pts)
 
-        # 7. SCALE KEYPOINTS TO ORIGINAL SIZE
+        # 8. SCALE BACK
         scale_x = W_original / float(train_w)
         scale_y = H_original / float(train_h)
-        
         pts[0, :] *= scale_x
         pts[1, :] *= scale_y
 
